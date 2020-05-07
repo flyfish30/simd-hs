@@ -5,6 +5,8 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE TypeInType #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 
 module SimdLlvm where
@@ -13,6 +15,11 @@ import Control.DeepSeq (NFData, force)
 import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
+import GHC.TypeLits
+import Data.Kind
+import Data.Proxy
+import Data.Int
+import Data.Word
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS
 import Data.Foldable
@@ -43,6 +50,8 @@ import qualified LLVM.Pretty as LLVMPretty
 import qualified LLVM.Relocation as Reloc
 import qualified LLVM.Target as JIT
 
+import FixedVector as V
+
 -- * Core expression type
 
 -- | An expression will be any value of type @'Fix' 'ExprF'@, which
@@ -69,6 +78,20 @@ data ExprF a e
     NegI e
   | -- | @'x'@
     VarI
+  | -- | a 'Int32x4' literal
+    LitVI Int32x4
+  | -- | @a+b@
+    AddVI e e
+  | -- | @a-b@
+    SubVI e e
+  | -- | @a*b@
+    MulVI e e
+  | -- | @a/b@
+    DivVI e e
+  | -- | @-a@
+    NegVI e
+  | -- | @'x'@
+    VarVI
   | -- | a 'Double' literal
     LitF Double
   | -- | @a+b@
@@ -102,6 +125,12 @@ type Expr a = Fix (ExprF a)
 x :: Expr a
 x = Fix VarF
 
+zx :: Expr a
+zx = Fix VarI
+
+vx :: Expr a
+vx = Fix VarVI
+
 liti :: Int -> Expr Int
 liti i = Fix (LitI i)
 
@@ -119,6 +148,27 @@ divi a b = Fix (DivI a b)
 
 negi :: Expr a -> Expr a
 negi a = Fix (NegI a)
+
+litvi :: Int32x4 -> Expr Int32x4
+litvi i = Fix (LitVI i)
+
+cvec :: [Int32] -> Expr Int32x4
+cvec = litvi . fromList
+
+addvi :: Expr a -> Expr a -> Expr a
+addvi a b = Fix (AddVI a b)
+
+subvi :: Expr a -> Expr a -> Expr a
+subvi a b = Fix (SubVI a b)
+
+mulvi :: Expr a -> Expr a -> Expr a
+mulvi a b = Fix (MulVI a b)
+
+divvi :: Expr a -> Expr a -> Expr a
+divvi a b = Fix (DivVI a b)
+
+negvi :: Expr a -> Expr a
+negvi a = Fix (NegVI a)
 
 litf :: Double -> Expr Double
 litf d = Fix (LitF d)
@@ -138,10 +188,6 @@ divf a b = Fix (DivF a b)
 negf :: Expr a -> Expr a
 negf a = Fix (NegF a)
 
-data SimdVector e = SimdVector Int e
-
--- type Int32x4 = SimdVector 4 Int
-
 instance Num (Expr Int) where
   fromInteger = liti . fromInteger
   (+) = addi
@@ -153,6 +199,23 @@ instance Num (Expr Int) where
 
 instance Fractional (Expr Int) where
   (/) = divi
+  recip = notImplemented "Expr.recip"
+  fromRational = notImplemented "Expr.intRatioinal"
+
+type Int16x4 = Vec 4 Int16
+type Int32x4 = Vec 4 Int32
+
+instance Num (Expr Int32x4) where
+  fromInteger = litvi . replicateVec . fromInteger
+  (+) = addvi
+  (-) = subvi
+  (*) = mulvi
+  negate = negvi
+  abs = notImplemented "Expr.abs"
+  signum = notImplemented "Expr.signum"
+
+instance Fractional (Expr Int32x4) where
+  (/) = divvi
   recip = notImplemented "Expr.recip"
   fromRational = notImplemented "Expr.intRatioinal"
 
@@ -216,13 +279,16 @@ ppExpAlg (MulI (e1, a) (e2, b)) =
   paren (isAdd e1 || isSub e1) a ++ " * " ++ paren (isAdd e2 || isSub e2) b
 ppExpAlg (DivI (e1, a) (e2, b)) =
   paren (isAdd e1 || isSub e1) a ++ " / " ++ paren (isComplex e2) b
-  where
-    isComplex (Fix (AddI _ _)) = True
-    isComplex (Fix (SubI _ _)) = True
-    isComplex (Fix (MulI _ _)) = True
-    isComplex (Fix (DivI _ _)) = True
-    isComplex _ = False
 ppExpAlg (NegI (_, a)) = paren True ("-" ++ a)
+ppExpAlg (LitVI i32) = show i32
+ppExpAlg (AddVI (_, a) (_, b)) = a ++ " + " ++ b
+ppExpAlg (SubVI (_, a) (e2, b)) =
+  a ++ " - " ++ paren (isAdd e2 || isSub e2) b
+ppExpAlg (MulVI (e1, a) (e2, b)) =
+  paren (isAdd e1 || isSub e1) a ++ " * " ++ paren (isAdd e2 || isSub e2) b
+ppExpAlg (DivVI (e1, a) (e2, b)) =
+  paren (isAdd e1 || isSub e1) a ++ " / " ++ paren (isComplex e2) b
+ppExpAlg (NegVI (_, a)) = paren True ("-" ++ a)
 ppExpAlg (LitF d) = show d
 ppExpAlg (AddF (_, a) (_, b)) = a ++ " + " ++ b
 ppExpAlg (SubF (_, a) (e2, b)) =
@@ -231,12 +297,6 @@ ppExpAlg (MulF (e1, a) (e2, b)) =
   paren (isAdd e1 || isSub e1) a ++ " * " ++ paren (isAdd e2 || isSub e2) b
 ppExpAlg (DivF (e1, a) (e2, b)) =
   paren (isAdd e1 || isSub e1) a ++ " / " ++ paren (isComplex e2) b
-  where
-    isComplex (Fix (AddF _ _)) = True
-    isComplex (Fix (SubF _ _)) = True
-    isComplex (Fix (MulF _ _)) = True
-    isComplex (Fix (DivF _ _)) = True
-    isComplex _ = False
 ppExpAlg (NegF (_, a)) = function "negate" a
 ppExpAlg (Exp (_, a)) = function "exp" a
 ppExpAlg (Log (_, a)) = function "log" a
@@ -244,6 +304,8 @@ ppExpAlg (Sqrt (_, a)) = function "sqrt" a
 ppExpAlg (Sin (_, a)) = function "sin" a
 ppExpAlg (Cos (_, a)) = function "cos" a
 ppExpAlg VarF = "x"
+ppExpAlg VarI = "zx"
+ppExpAlg VarVI = "vx"
 
 paren :: Bool -> String -> String
 paren b x
@@ -255,23 +317,42 @@ function name arg =
 
 isAdd :: Expr a -> Bool
 isAdd (Fix (AddI _ _)) = True
+isAdd (Fix (AddVI _ _)) = True
 isAdd (Fix (AddF _ _)) = True
 isAdd _ = False
 
 isSub :: Expr a -> Bool
 isSub (Fix (SubI _ _)) = True
+isSub (Fix (SubVI _ _)) = True
 isSub (Fix (SubF _ _)) = True
 isSub _ = False
 
 isLit :: Expr a -> Bool
 isLit (Fix (LitI _)) = True
+isLit (Fix (LitVI _)) = True
 isLit (Fix (LitF _)) = True
 isLit _ = False
 
 isVar :: Expr a -> Bool
 isVar (Fix VarI) = True
+isVar (Fix VarVI) = True
 isVar (Fix VarF) = True
 isVar _ = False
+
+isComplex :: Expr a -> Bool
+isComplex (Fix (AddI _ _)) = True
+isComplex (Fix (SubI _ _)) = True
+isComplex (Fix (MulI _ _)) = True
+isComplex (Fix (DivI _ _)) = True
+isComplex (Fix (AddVI _ _)) = True
+isComplex (Fix (SubVI _ _)) = True
+isComplex (Fix (MulVI _ _)) = True
+isComplex (Fix (DivVI _ _)) = True
+isComplex (Fix (AddF _ _)) = True
+isComplex (Fix (SubF _ _)) = True
+isComplex (Fix (MulF _ _)) = True
+isComplex (Fix (DivF _ _)) = True
+isComplex _ = False
 
 -- * Simple evaluator
 
@@ -337,11 +418,11 @@ declarePrimitives expr = fmap Map.fromList
     return (primName, f)
   where
     primitives = Set.toList (cata alg expr)
-    alg (Exp ps) = Set.insert "exp" ps
-    alg (Log ps) = Set.insert "log" ps
+    alg (Exp  ps) = Set.insert "exp"  ps
+    alg (Log  ps) = Set.insert "log"  ps
     alg (Sqrt ps) = Set.insert "sqrt" ps
-    alg (Sin ps) = Set.insert "sin" ps
-    alg (Cos ps) = Set.insert "cos" ps
+    alg (Sin  ps) = Set.insert "sin"  ps
+    alg (Cos  ps) = Set.insert "cos"  ps
     alg e = fold e
 
 -- | Generate an LLVM IR module for the given expression,
@@ -351,20 +432,31 @@ declarePrimitives expr = fmap Map.fromList
 codegen :: Expr a -> LLVM.Module
 codegen fexpr = LLVMIR.buildModule "arith.ll" $ do
   prims <- declarePrimitives fexpr
-  _ <- LLVMIR.function "f" [(LLVM.double, xparam)] LLVM.double $ \[arg] -> do
+  -- _ <- LLVMIR.function "f" [(LLVM.double, xparam)] LLVM.double $ \[arg] -> do
+  _ <- LLVMIR.function "fv" [(LLVM.VectorType 4 LLVM.i32, xparam)] (LLVM.VectorType 4 LLVM.i32) $ \[arg] -> do
     res <- cataM (alg arg prims) fexpr
     LLVMIR.ret res
   return ()
   where
     alg arg _ (LitI i) =
       return (LLVM.ConstantOperand $ LLVM.Int 32 (toInteger i))
+    alg arg _ (LitVI i32) =
+      return (LLVM.ConstantOperand $ LLVM.Vector (fmap (LLVM.Int 32 . toInteger) $ V.toList i32))
     alg arg _ VarI = return arg
+    alg arg _ VarVI = return arg
     alg arg _ (AddI a b) = LLVMIR.add a b `LLVMIR.named` "x"
     alg arg _ (SubI a b) = LLVMIR.sub a b `LLVMIR.named` "x"
     alg arg _ (MulI a b) = LLVMIR.mul a b `LLVMIR.named` "x"
     alg arg _ (DivI a b) = LLVMIR.sdiv a b `LLVMIR.named` "x"
+    alg arg _ (AddVI a b) = LLVMIR.add a b `LLVMIR.named` "x"
+    alg arg _ (SubVI a b) = LLVMIR.sub a b `LLVMIR.named` "x"
+    alg arg _ (MulVI a b) = LLVMIR.mul a b `LLVMIR.named` "x"
+    alg arg _ (DivVI a b) = LLVMIR.sdiv a b `LLVMIR.named` "x"
     alg arg ps (NegI a) = do
       z <- alg arg ps (LitI 0)
+      LLVMIR.sub z a `LLVMIR.named` "x"
+    alg arg ps (NegVI a) = do
+      z <- alg arg ps (LitVI (replicateVec 0))
       LLVMIR.sub z a `LLVMIR.named` "x"
     alg arg _ (LitF d) =
       return (LLVM.ConstantOperand $ LLVM.Float $ LLVM.Double d)
